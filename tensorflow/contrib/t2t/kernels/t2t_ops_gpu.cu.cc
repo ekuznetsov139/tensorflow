@@ -18,10 +18,48 @@ namespace tensorflow {
 
 typedef Eigen::GpuDevice GPUDevice;
 
+__device__ float2& operator+=(float2& a, const float2& b)
+{
+  a.x+=b.x;
+  a.y+=b.y;
+  return a;
+}
+
+__device__ void add_shfl_xor(float2& var, unsigned m)
+{
+  var.x += __shfl_xor_sync((unsigned)-1, var.x, m);
+  var.y += __shfl_xor_sync((unsigned)-1, var.y, m);
+}
+
+template <class T>
+__device__ void reduce_sum_across_block(T& v)
+{
+    assert(!(blockDim.x & 31));
+    int tid = threadIdx.x & 31;
+    int xid = threadIdx.x >> 5;
+    int xdim = blockDim.x >> 5;
+    int yid = threadIdx.y;
+    __shared__ T sums[32][32]; // 8 kb for 2x float - overkill but simplifies coding
+    T* p = &sums[yid][xid];
+
+    for(int m=1; m<32; m*=2)
+      add_shfl_xor(v, m);
+
+    if(tid==0)
+      p[0] = v;
+   __syncthreads();
+    for(int m=1; m<32; m*=2)
+    {
+      if((tid==0) && (!(xid & m)) && (xid+m<xdim))
+          p[0] += p[m];
+      __syncthreads();
+    }
+    v = sums[yid][0];
+}
+
 template <typename T, typename U>
 __global__ void CustomL2NormFunctor_kernel_stage1(int N, int k, const T* in, float* out, float averager, const U* _eps)
 {
- //   int i = threadIdx.x;
     int idx = threadIdx.y + blockDim.y*(blockIdx.x + 1024*blockIdx.y);
     if(idx>=N)
       return;
@@ -31,44 +69,28 @@ __global__ void CustomL2NormFunctor_kernel_stage1(int N, int k, const T* in, flo
       out[idx*2+0] = 0;
       out[idx*2+1] = 0;
     }
-    float sum = 0, sumsq = 0;
+    float2 sum = {0,0};
     for(int i=threadIdx.x; i<k; i+=blockDim.x)
     { 
       float t = (float)in[idx*k+i];
-      sum += t;
-      sumsq += t*t;
+      sum.x += t;
+      sum.y += t*t;
     }
-    for(int m=1; m<32; m*=2)
-    {
-      sum += __shfl_xor_sync((unsigned)-1, sum, m);
-      sumsq += __shfl_xor_sync((unsigned)-1, sumsq, m);
-    }
-    __syncthreads();
-    if((threadIdx.x & 31)==0)
-    {
-      atomicAdd(out+idx*2+0, sum);
-      atomicAdd(out+idx*2+1, sumsq);
-    }
-    __syncthreads();
+    reduce_sum_across_block(sum);
     if(threadIdx.x==0)
     {
-      sum = out[idx*2+0];
-      sumsq = out[idx*2+1];
-      sumsq -= sum*sum*averager;
-      float mean = sum*averager;
-      float sigma = sumsq*averager;
+      sum.y -= sum.x*sum.x*averager;
+      float mean = sum.x*averager;
+      float sigma = sum.y*averager;
       sigma = rsqrt(sigma+eps);
-
       out[idx*2+0] = mean;
       out[idx*2+1] = sigma;
     }
- 
 }
 
 template <typename T, typename U>
 __global__ void CustomL2NormFunctor_kernel_stage2(int N, int k, const T* in, const float* temp, T* out, const U* _bias, const U* _scale)
 {
-  //int k = blockDim.x;
   int idx = threadIdx.y + blockDim.y*(blockIdx.x + 1024*blockIdx.y);
   if(idx>=N)
     return;
@@ -81,7 +103,6 @@ __global__ void CustomL2NormFunctor_kernel_stage2(int N, int k, const T* in, con
 template <typename T, typename U>
 __global__ void CustomL2NormGradFunctor_kernel_stage2(int N, int k, const T* in, const T* out_grad, float* temp, T* out, float a,   const U* _bias, const U* _scale)
 {
-    //int i = threadIdx.x;
     int idx = threadIdx.y + blockDim.y*(blockIdx.x + 1024*blockIdx.y);
     if(idx>=N)
       return;
@@ -90,34 +111,16 @@ __global__ void CustomL2NormGradFunctor_kernel_stage2(int N, int k, const T* in,
     T* op = out+idx*k;
     const T* ip = in+idx*k;
     const T* ogp = out_grad+idx*k;
-    float s1 = 0;
-    float s2 = 0;
+    float2 s = {0,0};
     for(int i=threadIdx.x; i<k; i+=blockDim.x)
     {
       float t = (float)ogp[i] * (float)_scale[i];
-      s1 += t;
-      s2 += t * ((float)ip[i]-mean);
+      s.x += t;
+      s.y += t * ((float)ip[i]-mean);
     }
-    __syncthreads();
-    if(threadIdx.x==0)
-    {
-      temp[idx*2+0]=0;
-      temp[idx*2+1]=0;
-    }
-    for(int m=1; m<32; m*=2)
-    {
-      s1 += __shfl_xor_sync((unsigned)-1, s1, m);
-      s2 += __shfl_xor_sync((unsigned)-1, s2, m);
-    }
-    __syncthreads();
-    if((threadIdx.x & 31)==0)
-    {
-      atomicAdd(temp+idx*2+0, s1);
-      atomicAdd(temp+idx*2+1, s2);
-    }
-    __syncthreads();
-    s1 = temp[idx*2+0];
-    s2 = temp[idx*2+1];
+    reduce_sum_across_block(s);
+    float s1 = s.x;
+    float s2 = s.y;
     s1 *= a*sigma;
     s2 *= a*sigma*sigma*sigma;
     for(int i=threadIdx.x; i<k; i+=blockDim.x)
