@@ -324,7 +324,7 @@ DO_REGISTER_ALL(DEVICE_CPU, CPUDevice);
 REGISTER_KERNEL_BUILDER(Name("CustomDropout").Device(DEVICE_CPU).TypeConstraint<float>("T"), CustomDropoutOp<CPUDevice, float>);
 REGISTER_KERNEL_BUILDER(Name("CustomDropout").Device(DEVICE_CPU).TypeConstraint<Eigen::half>("T"), CustomDropoutOp<CPUDevice, Eigen::half>);
 
-#ifdef GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 DO_REGISTER_ALL(DEVICE_GPU, Eigen::GpuDevice);
 REGISTER_KERNEL_BUILDER(Name("CustomDropout").Device(DEVICE_GPU).TypeConstraint<float>("T"), CustomDropoutOp<Eigen::GpuDevice, float>);

@@ -93,18 +93,20 @@ class CustomL2Test(tf.test.TestCase):
 	def test6(self):
 		self.doTest(v6)
 	def test7(self):
-		for n in range(5):
+		for n in range(20):
 			shape=[np.random.randint(1,100),np.random.randint(1,100),np.random.randint(1,500)] 
 			np.random.shuffle(shape)
 			print(shape)
 			self.doTest(np.random.normal(size=shape))
 	def test8(self):
-		for n in range(5):
+		for n in range(20):
 			shape=[np.random.randint(1,20),np.random.randint(1,10),np.random.randint(1024,3072)] 
 			np.random.shuffle(shape)
 			print(shape)
 			self.doTest(np.random.normal(size=shape))
 
+
+"""
 class CustomDropoutTest(tf.test.TestCase):
 	def test1(self):
 		for dev in range(2):
@@ -129,7 +131,7 @@ class CustomDropoutTest(tf.test.TestCase):
 						ref, test, grad_ref, grad_test=testInnerDropout(shape)
 						self.assertAllCloseAccordingToType(test.eval(), ref.eval(), float_atol=1e-4)
 						self.assertAllCloseAccordingToType(grad_test[0].eval(), grad_ref[0].eval(), float_atol=1e-4)
-
+"""
 
 if __name__ == "__main__":
   tf.test.main()

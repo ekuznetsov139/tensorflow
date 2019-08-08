@@ -1,8 +1,11 @@
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 #define EIGEN_USE_GPU
 
 #include "t2t_ops.h"
+#if TENSORFLOW_USE_ROCM
+#include <hip/hip_runtime.h>
+#endif
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/util/gpu_device_functions.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -12,23 +15,28 @@
 #include "tensorflow/core/util/gpu_kernel_helper.h"
 #include <inttypes.h>
 
-#include <cuda_fp16.h>
+//#include <cuda_fp16.h>
 
 namespace tensorflow {
-
+namespace internal {
 typedef Eigen::GpuDevice GPUDevice;
-
+#if GOOGLE_CUDA
 __device__ float2& operator+=(float2& a, const float2& b)
 {
   a.x+=b.x;
   a.y+=b.y;
   return a;
 }
-
+#endif
 __device__ void add_shfl_xor(float2& var, unsigned m)
 {
-  var.x += __shfl_xor_sync((unsigned)-1, var.x, m);
-  var.y += __shfl_xor_sync((unsigned)-1, var.y, m);
+#if GOOGLE_CUDA && (CUDA_VERSION >= 9000)
+  var.x += __shfl_xor_sync((unsigned)-1, var.x, m, 32);
+  var.y += __shfl_xor_sync((unsigned)-1, var.y, m, 32);
+#else
+	var.x += __shfl_xor(var.x, m, warpSize);
+	var.y += __shfl_xor(var.y, m, warpSize);
+#endif
 }
 
 template <class T>
@@ -39,7 +47,8 @@ __device__ void reduce_sum_across_block(T& v)
     int xid = threadIdx.x >> 5;
     int xdim = blockDim.x >> 5;
     int yid = threadIdx.y;
-    __shared__ T sums[32][32]; // 8 kb for 2x float - overkill but simplifies coding
+	/*
+    __shared__ T sums[32][32+1]; // 8 kb for 2x float - overkill but simplifies coding
     T* p = &sums[yid][xid];
 
     for(int m=1; m<32; m*=2)
@@ -54,7 +63,92 @@ __device__ void reduce_sum_across_block(T& v)
           p[0] += p[m];
       __syncthreads();
     }
-    v = sums[yid][0];
+	*/
+	/*	
+	// works
+	__shared__ T sums[1024];
+	sums[threadIdx.x + yid*blockDim.x] = v;
+	__syncthreads();
+	for(int m=1; m<blockDim.x; m*=2)
+	{
+		if((!(threadIdx.x & m)) && ((threadIdx.x ^ m) < blockDim.x))
+			sums[threadIdx.x + yid*blockDim.x] += sums[(threadIdx.x ^ m) + yid*blockDim.x];
+		__syncthreads();
+	}
+	v = sums[yid*blockDim.x];
+	*/
+	/*
+	__shared__ T sums[1024];
+	for(int m=1; m<32; m*=2)
+	add_shfl_xor(v, m);
+	if(tid==0)
+	sums[(xid+yid*xdim)*32] = v;
+	__syncthreads();
+	for(int m=32; m<blockDim.x; m*=2)
+	{
+	if(tid==0 && (!(threadIdx.x & m)) && ((threadIdx.x ^ m) < blockDim.x))
+	sums[(xid+yid*xdim)*32] += sums[(threadIdx.x ^ m) + yid*blockDim.x];
+	__syncthreads();
+	}
+	v = sums[yid*blockDim.x];
+	*/
+	__shared__ T sums[1024];
+	for(int m=1; m<32; m*=2)
+		add_shfl_xor(v, m);
+	int bid = xid+yid*xdim;
+	if(tid==0)
+	{
+//		if(bid<0 || bid>=32)
+//			printf("Error1 %d %d %d\n", xid, yid, xdim);
+		sums[bid] = v;
+	}
+	__syncthreads();
+	for(int m=32; m<blockDim.x; m*=2)
+	{
+		if(tid==0 && (!(threadIdx.x & m)) && ((threadIdx.x ^ m) < blockDim.x))
+		{
+			int aid = ((xid ^ (m>>5)) + yid*xdim);
+//			if(aid<0 || aid>=32)
+//				printf("Error2 %d %d %d %d\n", xid, m>>5, yid, xdim);
+
+			sums[bid] += sums[aid];
+		}
+		__syncthreads();
+	}
+//	if(yid*xdim>=32)
+//		printf("Error3 %d %d\n", yid, xdim);
+	v = sums[yid*xdim];
+	/*
+	__shared__ T sums2[1024];
+	bid = xid+yid*xdim;
+	if(tid==0)
+	{
+		if(bid<0 || bid>=32)
+			printf("Error1 %d %d %d\n", xid, yid, xdim);
+		sums2[bid] = v;
+	}
+	__syncthreads();
+	for(int m=32; m<blockDim.x; m*=2)
+	{
+		if(tid==0 && (!(threadIdx.x & m)) && ((threadIdx.x ^ m) < blockDim.x))
+		{
+			int aid = ((xid ^ (m>>5)) + yid*xdim);
+			if(aid<0 || aid>=32)
+				printf("Error2 %d %d %d %d\n", xid, m>>5, yid, xdim);
+
+			sums2[bid] += sums2[aid];
+		}
+		__syncthreads();
+	}
+	if(yid*xdim>=32)
+		printf("Error3 %d %d\n", yid, xdim);
+	T v2 = sums2[yid*xdim];
+	if(v!=v2)
+	{
+		printf("Mismatch %f %f  %f %f   %d %d / %d %d\n",
+			v.x, v.y, v2.x, v2.y, threadIdx.x, threadIdx.y, blockDim.x, blockDim.y);
+	}
+	*/
 }
 
 template <typename T, typename U>
@@ -126,7 +220,7 @@ __global__ void CustomL2NormGradFunctor_kernel_stage2(int N, int k, const T* in,
     for(int i=threadIdx.x; i<k; i+=blockDim.x)
         op[i] = (T) ((float)ogp[i] * (float)_scale[i] * sigma - s1 - s2*((float)ip[i]-mean));
 }
-
+};
 template <typename T, typename U>
 void CustomL2NormFunctor<Eigen::GpuDevice, T, U>::operator()(const Eigen::GpuDevice& d, 
     uint64_t N, uint64_t k,
@@ -140,14 +234,17 @@ void CustomL2NormFunctor<Eigen::GpuDevice, T, U>::operator()(const Eigen::GpuDev
     int thrRound = min(1024ul, (k+31)&~31);
     threads=dim3(thrRound, 1024/thrRound, 1);
     blocks=dim3( max(1ul, uint64_t((N+threads.y-1) / threads.y)), 1, 1);
-    CustomL2NormFunctor_kernel_stage1<T,U> <<<blocks, threads, 0, d.stream()>>> (N, k, in, temp, 1./k, eps);
+    TF_CHECK_OK(GpuLaunchKernel(
+    	internal::CustomL2NormFunctor_kernel_stage1<T,U>, blocks, threads, 0, d.stream(),
+	N, k, in, temp, 1./k, eps));
 
     thrRound = min(1024ul, k);
     threads = dim3(thrRound, 1024/thrRound, 1);
     blocks=dim3( max(1ul, uint64_t((N+threads.y-1) / threads.y)), 1, 1);
     if(blocks.x>1024)
       blocks=dim3(1024, (blocks.x+1023)/1024, 1);
-    CustomL2NormFunctor_kernel_stage2<T,U> <<<blocks, threads, 0, d.stream()>>> (N, k, in, temp, out, bias, scale);
+	TF_CHECK_OK(GpuLaunchKernel(internal::CustomL2NormFunctor_kernel_stage2<T,U>, blocks, threads, 0, d.stream(), 
+	N, k, in, temp, out, bias, scale));
   }
 }
 
@@ -168,11 +265,14 @@ void CustomL2NormGradFunctor<Eigen::GpuDevice, T, U>::operator()(const Eigen::Gp
     blocks=dim3( max(1ul, uint64_t((N+threads.y-1) / threads.y)), 1, 1);
     if(blocks.x>1024)
       blocks=dim3(1024, (blocks.x+1023)/1024, 1);
-    CustomL2NormFunctor_kernel_stage1<T,U> <<<blocks, threads, 0, d.stream()>>> (N, k, in, temp, 1./k, eps);
-    CustomL2NormGradFunctor_kernel_stage2<T,U> <<<blocks, threads, 0, d.stream()>>> (N, k, in, outgrad, temp, out, 1./k, bias, scale);
+	TF_CHECK_OK(GpuLaunchKernel(internal::CustomL2NormFunctor_kernel_stage1<T,U>, blocks, threads, 0, d.stream(),
+		N, k, in, temp, 1./k, eps));
+	TF_CHECK_OK(GpuLaunchKernel(internal::CustomL2NormGradFunctor_kernel_stage2<T, U>, blocks, threads, 0, d.stream(),
+		N, k, in, outgrad, temp, out, 1./k, bias, scale));
   }
 }
 
+namespace internal {
 template <typename T>
 __global__ void CustomDropoutFunctor1_kernel(const T* in,
     const T* rng,
@@ -286,7 +386,7 @@ __global__ void CustomDropoutFunctor4_kernel(const T* in,
           out[off1] = in[off1] * (rng[off2]>=threshold ? scale : (T)0.0);
         }
 }
-
+};
 template <typename T>
 void CustomDropoutFunctor2<Eigen::GpuDevice, T>::operator()(const Eigen::GpuDevice& d, 
     const T* in,
@@ -300,7 +400,8 @@ void CustomDropoutFunctor2<Eigen::GpuDevice, T>::operator()(const Eigen::GpuDevi
 {
     dim3 threads(min(d1,1024),1,1);
     dim3 blocks(min(1024,d0),min(1024,(d0+1023)/1024),1);
-    CustomDropoutFunctor2_kernel<<<blocks,threads,0, d.stream()>>> (in, rng, out, pthr, d0, d1, s0, s1, r0, r1);
+	TF_CHECK_OK(GpuLaunchKernel(internal::CustomDropoutFunctor2_kernel<T>, blocks, threads, 0, d.stream(),
+		in, rng, out, pthr, d0, d1, s0, s1, r0, r1));
 }
 
 template <typename T>
@@ -317,7 +418,8 @@ void CustomDropoutFunctor3<Eigen::GpuDevice, T>::operator()(const Eigen::GpuDevi
   if(r0==s0 && r1==s1 && r2==s2)
   {
     int dim = d0*d1*d2;
-    CustomDropoutFunctor1_kernel<<<(dim+1023)/1024,min(dim,1024),0, d.stream()>>> (in, rng, out, pthr, dim);
+	TF_CHECK_OK(GpuLaunchKernel(internal::CustomDropoutFunctor1_kernel<T>, (dim+1023)/1024, min(dim,1024),0, d.stream(),
+		in, rng, out, pthr, dim));
   }
   else if(d0 == 1)
   {
@@ -329,7 +431,8 @@ void CustomDropoutFunctor3<Eigen::GpuDevice, T>::operator()(const Eigen::GpuDevi
     int threads_y = min(d1, 1024/threads_x);
     dim3 threads(threads_x, threads_y, 1);
     dim3 blocks((d2+1023)/1024, min(65536,d0),min(65536,(d0+65535)/65536));
-    CustomDropoutFunctor3_kernel<<<blocks,threads,0, d.stream()>>> (in, rng, out, pthr, d0, d1, d2, s0, s1, s2, r0, r1, r2);
+	TF_CHECK_OK(GpuLaunchKernel(internal::CustomDropoutFunctor3_kernel<T>, blocks,threads,0, d.stream(),
+		in, rng, out, pthr, d0, d1, d2, s0, s1, s2, r0, r1, r2));
   }
 }
 
@@ -348,7 +451,8 @@ void CustomDropoutFunctor4<Eigen::GpuDevice, T>::operator()(const Eigen::GpuDevi
   if(r0==s0 && r1==s1 && r2==s2 && r3==s3)
   {
     int dim = d0*d1*d2*d3;
-    CustomDropoutFunctor1_kernel<<<(dim+1023)/1024,min(dim,1024),0, d.stream()>>> (in, rng, out, pthr, dim);
+	TF_CHECK_OK(GpuLaunchKernel(internal::CustomDropoutFunctor1_kernel<T>, (dim+1023)/1024, min(dim, 1024), 0, d.stream(),
+		in, rng, out, pthr, dim));
   }
   else if(d0 == 1)
   {
@@ -364,7 +468,8 @@ void CustomDropoutFunctor4<Eigen::GpuDevice, T>::operator()(const Eigen::GpuDevi
     int threads_y = min(d2, 1024/threads_x);
     dim3 threads(threads_x, threads_y, 1);
     dim3 blocks((d3+1023)/1024, min(65536,d1),min(65536,d0));
-    CustomDropoutFunctor4_kernel<<<blocks,threads,0, d.stream()>>> (in, rng, out, pthr, d0, d1, d2, d3, s0, s1, s2, s3, r0, r1, r2, r3);
+	TF_CHECK_OK(GpuLaunchKernel(internal::CustomDropoutFunctor4_kernel<T>, blocks,threads,0, d.stream(),
+		in, rng, out, pthr, d0, d1, d2, d3, s0, s1, s2, s3, r0, r1, r2, r3));
   }
 }
 

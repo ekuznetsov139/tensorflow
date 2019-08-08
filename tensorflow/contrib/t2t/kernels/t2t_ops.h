@@ -65,7 +65,7 @@ struct CustomDropoutFunctor4 {
     );
 };
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 template <typename T, typename U>
 struct CustomL2NormFunctor<Eigen::GpuDevice, T, U> {
   void operator()(const Eigen::GpuDevice& d, 

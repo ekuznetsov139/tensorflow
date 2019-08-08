@@ -33,14 +33,15 @@ load("//tensorflow:tensorflow.bzl", "tf_custom_op_py_library")
 tf_custom_op_library(
     name = "python/ops/_t2t_ops.so",
     srcs = [
-        "kernels/t2t_ops.cc",
-        "kernels/t2t_ops.h",
+#        "kernels/t2t_ops.cc",
+#        "kernels/t2t_ops.h",
         "ops/t2t_ops.cc",
     ],
     gpu_srcs = [
-        "kernels/t2t_ops_gpu.cu.cc",
+#        "kernels/t2t_ops_gpu.cu.cc",
         "kernels/t2t_ops.h",
     ],
+	deps = [":t2t_ops_kernels"]
 )
 
 tf_custom_op_py_library(
